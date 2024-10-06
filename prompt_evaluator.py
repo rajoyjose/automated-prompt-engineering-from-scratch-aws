@@ -1,50 +1,113 @@
 import asyncio
 import pandas as pd
-from vertexai.generative_models import GenerativeModel
 from tqdm.asyncio import tqdm_asyncio
 import backoff
+import inspect
+import boto3
+import os
+import json
+from botocore.config import Config
 
 class ReviewModelError(Exception):
     """Custom exception for review model errors."""
     pass
 
 class PromptEvaluator:
-    def __init__(self, df_train, target_model_name, target_model_config, review_model_name, review_model_config, safety_settings, review_prompt_template_path):
+    
+    def __init__(self, df_train, target_model_name, target_model_native_version, target_model_config, review_model_name, review_model_config, review_prompt_template_path):
+        #frame = inspect.currentframe()
+        #args, _, _, values = inspect.getargvalues(frame)
+        #print("Function parameters:")
+        #for arg in args:
+        #    print(f"{arg} = {values[arg]}")
+        #increase the standard time out limits in boto3, because Bedrock may take a while to respond to large requests.
+        my_config = Config(
+            connect_timeout=60*3,
+            read_timeout=60*3,
+        )
+        self.bedrock = boto3.client(service_name='bedrock-runtime',config=my_config)
+        self.bedrock_service = boto3.client(service_name='bedrock',config=my_config)
+        self.accept = 'application/json'
+        self.contentType = 'application/json'
+        
         self.df_train = df_train
         self.target_model_name = target_model_name
+        self.target_model_native_version = target_model_native_version
+        self.review_model_native_version = target_model_native_version
         self.target_model_config = target_model_config
         self.review_model_name = review_model_name
         self.review_model_config = review_model_config
-        self.safety_settings = safety_settings
         self.review_prompt_template_path = review_prompt_template_path
 
-        self.target_model = GenerativeModel(self.target_model_name)
-        self.review_model = GenerativeModel(self.review_model_name)
 
+        
     @backoff.on_exception(backoff.expo, Exception, max_tries=5)
     async def generate_target_model_response(self, question, prompt):
-        target_model = GenerativeModel(
-            self.target_model_name,
-            generation_config=self.target_model_config,
-            safety_settings=self.safety_settings,
-            system_instruction=prompt
+        #target_model = GenerativeModel(
+        #   self.target_model_name,
+        #   generation_config=self.target_model_config,
+        #   system_instruction=prompt
+        #)
+        #print ("in generate_target_model_response")
+        #print(self.target_model_native_version)
+        # print("Local variables:")
+        # current_frame = inspect.currentframe()
+        # local_vars = current_frame.f_locals
+        # for var_name, var_value in local_vars.items():
+        #  print(f"{var_name}: {var_value}")
+        #print("Printing body 1")
+        body = json.dumps({
+            "anthropic_version": self.target_model_native_version,
+            "max_tokens": self.target_model_config['max_output_tokens'],
+            "system": prompt,
+            "temperature": self.target_model_config['temperature'],
+            "top_p": self.target_model_config['top_p'],
+            "messages": [
+                {
+                "role": "user",
+                "content": [{"type": "text", "text": question}]
+                }
+            ],
+        })
+        #print("Printing body2")
+        #print("Target: invoking bedrock body")
+        response = self.bedrock.invoke_model(
+        body=body, modelId=self.target_model_name, accept=self.accept, contentType=self.contentType
         )
-
-        response = await target_model.generate_content_async(
-            question,
-            stream=False,
-        )
-        return response.text
+        #print("invoking bedrock body")
+        response_body = json.loads(response.get("body").read())
+        #print(response_body)
+        #outputText = response_body.get("content")[0].get("text")
+        outputText = response_body["content"][0]["text"]
+        # response = await target_model.generate_content_async(
+        #    question,
+        #     stream=False,
+        # )                
+        return outputText.strip().lower()
 
     @backoff.on_exception(backoff.expo, Exception, max_tries=5)
     async def generate_review_model_response(self, review_prompt):
-        review_response = await self.review_model.generate_content_async(
-            [review_prompt],
-            generation_config=self.review_model_config,
-            safety_settings=self.safety_settings,
-            stream=False,
+        #print ("in generate_review_model_response")
+        body = json.dumps({
+            "anthropic_version": self.review_model_native_version,
+            "max_tokens": self.review_model_config['max_output_tokens'],
+            "temperature": self.review_model_config['temperature'],
+            "top_p": self.review_model_config['top_p'],
+            "messages": [
+                {
+                "role": "user",
+                "content": [{"type": "text", "text": review_prompt}]
+                }
+            ],
+        })
+        #print("review: invoking bedrock body")
+        response = self.bedrock.invoke_model(
+            body=body, modelId=self.review_model_name, accept=self.accept, contentType=self.contentType
         )
-        return review_response.text.strip().lower()
+        response_body = json.loads(response.get("body").read())
+        #print(response_body)
+        outputText = response_body["content"][0]["text"]
+        return outputText.strip().lower()
 
     async def generate_and_review(self, row, prompt):
         try:
